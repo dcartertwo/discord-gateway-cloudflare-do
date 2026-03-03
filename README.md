@@ -21,6 +21,7 @@ export { DiscordGatewayDO };
 interface Env {
   DISCORD_GATEWAY: DurableObjectNamespace<DiscordGatewayDO>;
   DISCORD_BOT_TOKEN: string;
+  DISCORD_GATEWAY_SECRET: string;
 }
 
 export default {
@@ -30,7 +31,7 @@ export default {
     // Receive forwarded Gateway events
     if (url.pathname === "/webhook" && request.method === "POST") {
       const token = request.headers.get("x-discord-gateway-token");
-      if (token !== env.DISCORD_BOT_TOKEN) {
+      if (token !== env.DISCORD_GATEWAY_SECRET) {
         return new Response("Unauthorized", { status: 401 });
       }
       const event = (await request.json()) as {
@@ -49,6 +50,7 @@ export default {
         await gateway.connect({
           botToken: env.DISCORD_BOT_TOKEN,
           webhookUrl: `${url.origin}/webhook`,
+          webhookSecret: env.DISCORD_GATEWAY_SECRET,
         }),
       );
     }
@@ -70,7 +72,7 @@ export default {
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_classes": ["DiscordGatewayDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["DiscordGatewayDO"] }
   ]
 }
 ```
@@ -84,12 +86,23 @@ curl -X POST https://my-bot.example.com/connect
 
 That's it. The connection survives Worker redeployments and DO evictions.
 
+## Discord Prerequisites
+
+Use Discord's official docs to configure your app and bot before calling `/connect`:
+
+- [Getting Started](https://discord.com/developers/docs/quick-start/getting-started)
+- [Gateway Intents](https://discord.com/developers/docs/topics/gateway#gateway-intents)
+- [Privileged Intents](https://discord.com/developers/docs/topics/gateway#privileged-intents)
+- [OAuth2 / Bot Authorization](https://discord.com/developers/docs/topics/oauth2)
+
+If intents are misconfigured, Discord will close with `4014` and the DO will stop reconnecting until config is fixed and `/connect` is called again.
+
 ## How It Works
 
 ```
                      ┌──────────────────────┐
                      │ Discord Gateway API  │
-                     └──────────���───────────┘
+                     └──────────┬───────────┘
                            WebSocket
                      ┌──────────┴───────────┐
                      │ DiscordGatewayDO     │
@@ -98,7 +111,7 @@ That's it. The connection survives Worker redeployments and DO evictions.
                      │  • auto-reconnect    │
                      └──────────┬───────────┘
                           HTTP POST
-                  x-discord-gateway-token: <botToken>
+                  x-discord-gateway-token: <webhookSecret>
                   { type, timestamp, data }
                      ┌──────────┴───────────┐
                      │ Your Worker          │
@@ -106,7 +119,7 @@ That's it. The connection survives Worker redeployments and DO evictions.
 ```
 
 The DO maintains a WebSocket to Discord and forwards events as HTTP POSTs to your webhook URL with:
-- Header: `x-discord-gateway-token: <botToken>`
+- Header: `x-discord-gateway-token: <webhookSecret>` (or bot token for backward compatibility)
 - Body: `{ type: "GATEWAY_MESSAGE_CREATE", timestamp: 1234567890, data: { ... } }`
 
 Only three event types are forwarded:
@@ -137,13 +150,16 @@ Stores credentials and opens a WebSocket to the Discord Gateway.
 
 ```typescript
 await gateway.connect({
-  botToken: "Bot MTk...",
+  botToken: "MTk...",
   webhookUrl: "https://my-bot.example.com/webhook",
+  webhookSecret: "your-random-webhook-secret",
 });
 // → { status: "connecting" }
 ```
 
 Returns `{ status: "connecting" }` on success, `{ error: string }` on failure. The webhook URL must be HTTPS.
+
+`webhookSecret` is optional but strongly recommended. If omitted, the DO falls back to using `botToken` in the forwarding header for backward compatibility.
 
 ### `gateway.disconnect()`
 
@@ -189,6 +205,8 @@ npm install chat @chat-adapter/discord chat-state-cloudflare-do discord-gateway-
 
 Both HTTP Interactions (slash commands) and forwarded Gateway events (messages, reactions) land on the same webhook endpoint. The Chat SDK auto-detects which type based on the `x-discord-gateway-token` header.
 
+For current Chat SDK compatibility, leave `webhookSecret` unset (or set it equal to `botToken`) so the forwarded header matches what the adapter expects.
+
 See [`examples/chat-sdk/`](./examples/chat-sdk) for a complete working example.
 
 ## Resilience
@@ -219,7 +237,7 @@ Complete examples in [`examples/`](./examples):
 npm install          # Install dependencies
 npm run build        # Build with tsup
 npm run typecheck    # TypeScript check
-npm test             # Run tests (15 tests)
+npm test             # Run tests (29 tests)
 ```
 
 Zero dependencies — only imports from `cloudflare:workers` (provided by the runtime). 14KB bundled.

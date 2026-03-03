@@ -9,6 +9,6 @@
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["ChatStateDO"], "new_classes": ["DiscordGatewayDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["ChatStateDO", "DiscordGatewayDO"] }
   ]
 }

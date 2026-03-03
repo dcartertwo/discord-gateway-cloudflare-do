@@ -20,6 +20,7 @@ export { DiscordGatewayDO };
 interface Env {
   DISCORD_GATEWAY: DurableObjectNamespace<DiscordGatewayDO>;
   DISCORD_BOT_TOKEN: string;
+  DISCORD_GATEWAY_SECRET: string;
 }
 
 /**
@@ -54,7 +55,7 @@ export default {
     if (url.pathname === "/webhook" && request.method === "POST") {
       // Verify the request came from our Gateway DO
       const token = request.headers.get("x-discord-gateway-token");
-      if (token !== env.DISCORD_BOT_TOKEN) {
+      if (token !== env.DISCORD_GATEWAY_SECRET) {
         return new Response("Unauthorized", { status: 401 });
       }
 
@@ -70,6 +71,7 @@ export default {
       const result = await gateway.connect({
         botToken: env.DISCORD_BOT_TOKEN,
         webhookUrl: `${url.origin}/webhook`,
+        webhookSecret: env.DISCORD_GATEWAY_SECRET,
       });
       return Response.json(result);
     }

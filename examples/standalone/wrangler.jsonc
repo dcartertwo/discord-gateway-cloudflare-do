@@ -8,6 +8,6 @@
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_classes": ["DiscordGatewayDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["DiscordGatewayDO"] }
   ]
 }

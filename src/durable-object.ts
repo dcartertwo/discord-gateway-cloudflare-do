@@ -6,12 +6,14 @@ import {
   type GatewayStatus,
   type GatewayCredentials,
   type StoredCredentials,
+  type ReconnectStrategy,
   type GatewayHello,
   type GatewayDispatch,
   type GatewayReady,
   type GatewayInvalidSession,
   type ForwardedGatewayEvent,
   type ForwardedEventType,
+  type GatewayBotResponse,
 } from "./types";
 
 const STATE_KEY = "gateway_state";
@@ -53,6 +55,25 @@ const WEBHOOK_MAX_ATTEMPTS = 2;
 const WEBHOOK_RETRY_DELAY_MS = 1_000;
 
 /**
+ * Close code used when intentionally restarting our own connection.
+ * Must be client-valid: either 1000 or 3000-4999.
+ */
+const INTERNAL_RECONNECT_CLOSE_CODE = 3001;
+
+/** Discord close codes that should not be retried. */
+const NON_RECONNECTABLE_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+
+/**
+ * Discord close codes where the next reconnect should start a fresh session.
+ * 4003 (Not authenticated) may indicate a previously invalidated session.
+ */
+const NON_RESUMABLE_CLOSE_CODES = new Set([4003, 4007, 4009]);
+
+type ConnectInternalResult =
+  | { ok: true }
+  | { ok: false; error: string; retryScheduled: boolean };
+
+/**
  * Discord Gateway Intents:
  * - GUILDS (1 << 0) — guild create/update/delete, role/channel events
  * - GUILD_MESSAGES (1 << 9) — message create/update/delete in guilds
@@ -89,6 +110,15 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   /** In-memory WebSocket reference (lost on DO eviction, recovered via alarm) */
   private upstream: WebSocket | null = null;
 
+  /** True when a close was intentionally initiated by disconnect() */
+  private suppressReconnect = false;
+
+  /** True when we already scheduled reconnect before a close event arrives */
+  private reconnectPlanned = false;
+
+  /** In-memory fast flag for terminal (non-reconnectable) gateway state */
+  private reconnectDisabled = false;
+
   /** Sliding-window timestamps for reconnect rate limiting (in-memory only) */
   private reconnectTimestamps: number[] = [];
 
@@ -121,16 +151,22 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    */
   async connect(
     credentials: GatewayCredentials,
-  ): Promise<{ status: string } | { error: string }> {
+  ): Promise<{ status: "connecting" } | { error: string }> {
     if (!credentials.botToken || !credentials.webhookUrl) {
       return { error: "botToken and webhookUrl are required" };
     }
 
-    // Validate webhookUrl is a valid HTTPS URL
+    // Validate webhookUrl is a valid HTTPS URL and safe target
     try {
       const parsed = new URL(credentials.webhookUrl);
       if (parsed.protocol !== "https:") {
         return { error: "webhookUrl must use HTTPS" };
+      }
+      if (parsed.username || parsed.password) {
+        return { error: "webhookUrl must not contain credentials" };
+      }
+      if (isPrivateHostname(parsed.hostname)) {
+        return { error: "webhookUrl host must be publicly routable" };
       }
     } catch {
       return { error: "webhookUrl must be a valid URL" };
@@ -139,11 +175,21 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     const stored: StoredCredentials = {
       botToken: credentials.botToken,
       webhookUrl: credentials.webhookUrl,
+      webhookSecret: credentials.webhookSecret,
     };
     await this.ctx.storage.put(CREDENTIALS_KEY, stored);
     this.cachedCredentials = stored;
 
-    await this.connectInternal();
+    // Explicit connect() should clear terminal reconnect-disabled mode.
+    const existingState = (await this.loadState()) ?? emptyState();
+    existingState.reconnectDisabled = false;
+    await this.saveState(existingState);
+    this.reconnectDisabled = false;
+
+    const result = await this.connectInternal();
+    if (!result.ok && !result.retryScheduled) {
+      return { error: result.error };
+    }
     return { status: "connecting" };
   }
 
@@ -151,7 +197,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    * Disconnect from the Discord Gateway.
    * Closes the WebSocket and clears all state.
    */
-  async disconnect(): Promise<{ status: string }> {
+  async disconnect(): Promise<{ status: "disconnected" }> {
     await this.disconnectInternal();
     await this.ctx.storage.delete(CREDENTIALS_KEY);
     this.cachedCredentials = null;
@@ -205,10 +251,31 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   }
 
   private async alarmInternal(): Promise<void> {
+    // Immediate in-memory guard for races with terminal close handling.
+    if (this.reconnectDisabled) return;
+
     const state = await this.loadState();
 
-    // No state — nothing to do
-    if (!state) return;
+    // No state can still happen if an alarm was scheduled before state persisted.
+    // If credentials exist, attempt a best-effort reconnect instead of no-oping.
+    if (!state) {
+      const creds = await this.loadCredentials();
+      if (!creds) return;
+      await this.connectInternal();
+      return;
+    }
+
+    if (state.reconnectDisabled) {
+      this.reconnectDisabled = true;
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    // Identify cooldown window from /gateway/bot session_start_limit.
+    if (state.identifyCooldownUntil && Date.now() < state.identifyCooldownUntil) {
+      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+      return;
+    }
 
     // No wsUrl means we're in a backoff period or delayed reconnect — reconnect now
     if (!state.wsUrl) {
@@ -222,7 +289,10 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       console.warn(
         "discord-gateway: WebSocket reference lost (DO eviction); reconnecting",
       );
-      await this.ctx.storage.delete(STATE_KEY);
+      // Keep resumable state (sessionId/sequence/resume URL) and reconnect.
+      state.wsUrl = null;
+      state.heartbeatIntervalMs = null;
+      await this.saveState(state);
       await this.connectInternal();
       return;
     }
@@ -250,29 +320,118 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
   // -- Connection management -----------------------------------------------
 
-  private async connectInternal(): Promise<void> {
-    const state = await this.loadState();
-    if (state?.wsUrl && this.upstream) return; // Already connected
+  private async connectInternal(): Promise<ConnectInternalResult> {
+    const state = (await this.loadState()) ?? emptyState();
+    if (this.upstream) return { ok: true };
 
-    // Stale state — WebSocket lost (DO eviction)
-    if (state?.wsUrl && !this.upstream) {
-      await this.ctx.storage.delete(STATE_KEY);
+    if (state.reconnectDisabled) {
+      return {
+        ok: false,
+        error: "reconnect disabled after terminal close code",
+        retryScheduled: false,
+      };
     }
 
     const creds = await this.loadCredentials();
     if (!creds) {
-      console.error("discord-gateway: no credentials stored; cannot connect");
-      return;
+      const error = "no credentials stored; cannot connect";
+      console.error(`discord-gateway: ${error}`);
+      return { ok: false, error, retryScheduled: false };
     }
 
-    const url = await this.getGatewayUrl(creds.botToken);
-    if (!url) return;
+    const resumable = canResume(state);
+    let gatewayUrl = resumable
+      ? state.resumeGatewayUrl ?? state.wsUrl
+      : state.wsUrl;
 
-    await this.openWebSocket(url);
+    if (!gatewayUrl) {
+      const info = await this.getGatewayInfo(creds.botToken);
+      if (!info.ok) {
+        console.error("discord-gateway: failed to resolve gateway URL", {
+          error: info.error,
+          retryable: info.retryable,
+          status: info.status,
+        });
+        if (info.retryable) {
+          await this.reconnectWithBackoff({
+            strategy: state.reconnectStrategy,
+            reason: info.error,
+          });
+          return { ok: false, error: info.error, retryScheduled: true };
+        }
+        return { ok: false, error: info.error, retryScheduled: false };
+      }
+
+      gatewayUrl = info.url;
+      if (info.sessionStartLimit) {
+        state.sessionStartRemaining = info.sessionStartLimit.remaining;
+        state.sessionStartResetAfterMs = info.sessionStartLimit.reset_after;
+        state.sessionStartTotal = info.sessionStartLimit.total;
+        state.sessionStartMaxConcurrency = info.sessionStartLimit.max_concurrency;
+      }
+    }
+
+    const needsIdentify = !canResume(state);
+    if (needsIdentify) {
+      const now = Date.now();
+      if (state.identifyCooldownUntil && now < state.identifyCooldownUntil) {
+        await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+        return {
+          ok: false,
+          error: "identify cooldown active",
+          retryScheduled: true,
+        };
+      }
+
+      if (
+        state.sessionStartRemaining !== null &&
+        state.sessionStartRemaining <= 0 &&
+        state.sessionStartResetAfterMs &&
+        state.sessionStartResetAfterMs > 0
+      ) {
+        state.identifyCooldownUntil = now + state.sessionStartResetAfterMs;
+        state.wsUrl = null;
+        await this.saveState(state);
+        await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+        return {
+          ok: false,
+          error: "session start limit exhausted; waiting for reset",
+          retryScheduled: true,
+        };
+      }
+    }
+
+    state.wsUrl = gatewayUrl;
+    state.heartbeatIntervalMs = null;
+    state.lastHeartbeatAck = Date.now();
+    state.connectedAt = new Date().toISOString();
+    state.reconnectDisabled = false;
+    await this.saveState(state);
+
+    const openResult = await this.openWebSocket(gatewayUrl);
+    if (!openResult.ok) {
+      if (openResult.retryable) {
+        await this.reconnectWithBackoff({
+          strategy: state.reconnectStrategy,
+          reason: openResult.error,
+        });
+      } else {
+        state.wsUrl = null;
+        await this.saveState(state);
+      }
+      return {
+        ok: false,
+        error: openResult.error,
+        retryScheduled: openResult.retryable,
+      };
+    }
+
+    return { ok: true };
   }
 
   private async disconnectInternal(): Promise<void> {
     if (this.upstream) {
+      this.suppressReconnect = true;
       try {
         this.upstream.close(1000, "client disconnect");
       } catch {
@@ -281,28 +440,42 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       this.upstream = null;
     }
     await this.ctx.storage.delete(STATE_KEY);
+    this.reconnectDisabled = false;
     // Cancel any pending alarm (heartbeat, backoff, etc.)
     await this.ctx.storage.deleteAlarm();
   }
 
-  private async reconnectWithBackoff(): Promise<void> {
-    const state = await this.loadState();
-    const attempts = (state?.reconnectAttempts ?? 0) + 1;
+  private async reconnectWithBackoff(options?: {
+    strategy?: ReconnectStrategy;
+    clearSession?: boolean;
+    reason?: string;
+  }): Promise<void> {
+    const state = (await this.loadState()) ?? emptyState();
+    const attempts = state.reconnectAttempts + 1;
 
     // Exponential backoff capped at MAX_BACKOFF_MS, with jitter
     const delay =
       Math.min(1000 * Math.pow(2, attempts), MAX_BACKOFF_MS) +
       Math.random() * 1000;
 
-    if (state) {
-      state.reconnectAttempts = attempts;
-      await this.saveState(state);
+    state.reconnectAttempts = attempts;
+    state.wsUrl = null;
+    state.heartbeatIntervalMs = null;
+    state.reconnectStrategy = options?.strategy ?? state.reconnectStrategy;
+    state.reconnectDisabled = false;
+
+    if (options?.clearSession) {
+      state.sessionId = null;
+      state.sequence = null;
     }
+
+    await this.saveState(state);
 
     // Close existing WebSocket
     if (this.upstream) {
+      this.reconnectPlanned = true;
       try {
-        this.upstream.close(1000, "reconnecting with backoff");
+        this.upstream.close(INTERNAL_RECONNECT_CLOSE_CODE, "reconnecting");
       } catch {
         /* already closed */
       }
@@ -312,6 +485,8 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     console.warn("discord-gateway: scheduling reconnect", {
       attempts,
       delayMs: Math.round(delay),
+      strategy: state.reconnectStrategy,
+      reason: options?.reason,
     });
     await this.ctx.storage.setAlarm(Date.now() + delay);
   }
@@ -320,23 +495,32 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    * Schedule a delayed reconnect via alarm instead of blocking with setTimeout.
    * Used for op 7 (Reconnect) where Discord requires a minimum delay.
    */
-  private async reconnectWithMinDelay(): Promise<void> {
+  private async reconnectWithMinDelay(options?: {
+    strategy?: ReconnectStrategy;
+    clearSession?: boolean;
+  }): Promise<void> {
+    const state = (await this.loadState()) ?? emptyState();
+    state.wsUrl = null;
+    state.heartbeatIntervalMs = null;
+    state.reconnectStrategy = options?.strategy ?? state.reconnectStrategy;
+    state.reconnectDisabled = false;
+
+    if (options?.clearSession) {
+      state.sessionId = null;
+      state.sequence = null;
+    }
+
+    await this.saveState(state);
+
     // Close existing connection
     if (this.upstream) {
+      this.reconnectPlanned = true;
       try {
-        this.upstream.close(1000, "reconnecting");
+        this.upstream.close(INTERNAL_RECONNECT_CLOSE_CODE, "reconnecting");
       } catch {
         /* already closed */
       }
       this.upstream = null;
-    }
-
-    // Clear state so alarm handler knows to call connectInternal()
-    const state = await this.loadState();
-    if (state) {
-      // Preserve session info for resume but clear wsUrl
-      state.wsUrl = null;
-      await this.saveState(state);
     }
 
     // Minimum 1-second delay via alarm — doesn't block the DO
@@ -361,28 +545,48 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
   // -- WebSocket management ------------------------------------------------
 
-  private async openWebSocket(url: string): Promise<void> {
+  private async openWebSocket(
+    url: string,
+  ): Promise<
+    { ok: true } | { ok: false; error: string; retryable: boolean }
+  > {
     const wsUrl = toHttpUrl(url) + `?v=${GATEWAY_VERSION}&encoding=json`;
-    const response = await fetch(wsUrl, {
-      headers: { Upgrade: "websocket" },
-    });
+
+    let response: Response;
+    try {
+      response = await fetch(wsUrl, {
+        headers: { Upgrade: "websocket" },
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        error: `websocket upgrade request failed: ${String(error)}`,
+        retryable: true,
+      };
+    }
 
     if (!response.webSocket) {
-      console.error(
-        `discord-gateway: failed to connect (${response.status})`,
-      );
-      await this.reconnectWithBackoff();
-      return;
+      const retryable =
+        response.status === 429 || response.status >= 500 || response.status === 0;
+      return {
+        ok: false,
+        error: `failed to connect (${response.status})`,
+        retryable,
+      };
     }
 
     const ws = response.webSocket;
     ws.accept();
     this.upstream = ws;
+    this.suppressReconnect = false;
+    this.reconnectPlanned = false;
 
     // Process messages sequentially via a promise chain to prevent
     // concurrent state mutations (especially sequence number races
     // during resume replays).
     ws.addEventListener("message", (evt) => {
+      if (this.upstream !== ws) return;
+
       this.messageQueue = this.messageQueue
         .then(() => this.handleGatewayMessage(String(evt.data)))
         .catch((err) =>
@@ -390,38 +594,71 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
             error: String(err),
           }),
         );
-      this.ctx.waitUntil(this.messageQueue);
     });
 
-    // Guard against double reconnect: both `error` and `close` events fire
-    // on WebSocket failure. The first handler to run sets upstream = null;
-    // the second sees it's already null and skips.
+    // Guard against double reconnect: both `error` and `close` events may fire
+    // on WebSocket failure. We only handle events for the currently active socket.
     ws.addEventListener("close", (evt) => {
-      if (!this.upstream) return; // Already handled by error event
+      if (this.upstream !== ws) return;
+
       console.warn("discord-gateway: WebSocket closed", {
         code: evt.code,
         reason: evt.reason,
       });
+
       this.upstream = null;
-      this.ctx.waitUntil(this.reconnectWithBackoff());
+
+      if (this.suppressReconnect) {
+        this.suppressReconnect = false;
+        return;
+      }
+
+      if (this.reconnectPlanned) {
+        this.reconnectPlanned = false;
+        return;
+      }
+
+      const policy = classifyCloseCode(evt.code);
+      if (!policy.shouldReconnect) {
+        // Set in-memory terminal mode immediately to avoid alarm races.
+        this.reconnectDisabled = true;
+        this.messageQueue = this.messageQueue
+          .then(() => this.stopReconnecting(evt.code, evt.reason))
+          .catch((error) =>
+            console.error("discord-gateway: stopReconnecting failed", {
+              error: String(error),
+              code: evt.code,
+            }),
+          );
+        return;
+      }
+
+      void this.reconnectWithBackoff({
+        strategy: policy.canResume ? "resume-or-identify" : "identify-only",
+        clearSession: !policy.canResume,
+        reason: `close ${evt.code}: ${evt.reason}`,
+      });
     });
 
     ws.addEventListener("error", (evt) => {
-      if (!this.upstream) return; // Already handled by close event
+      if (this.upstream !== ws) return;
       console.error("discord-gateway: WebSocket error", evt);
       this.upstream = null;
-      this.ctx.waitUntil(this.reconnectWithBackoff());
+
+      if (this.suppressReconnect) {
+        this.suppressReconnect = false;
+        return;
+      }
+
+      if (this.reconnectPlanned) return;
+
+      void this.reconnectWithBackoff({
+        strategy: "resume-or-identify",
+        reason: "websocket error event",
+      });
     });
 
-    await this.saveState({
-      wsUrl: url,
-      sessionId: null,
-      sequence: null,
-      heartbeatIntervalMs: null,
-      lastHeartbeatAck: Date.now(),
-      connectedAt: new Date().toISOString(),
-      reconnectAttempts: 0,
-    });
+    return { ok: true };
   }
 
   // -- Gateway message handling --------------------------------------------
@@ -449,6 +686,10 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       case GatewayOpcode.Dispatch:
         await this.handleDispatch(payload as GatewayDispatch, state);
         break;
+      case GatewayOpcode.Heartbeat:
+        // Discord heartbeat request opcode: respond immediately.
+        this.sendHeartbeat(state);
+        break;
       case GatewayOpcode.HeartbeatAck:
         await this.handleHeartbeatAck(state);
         break;
@@ -469,9 +710,15 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     state: GatewayState,
   ): Promise<void> {
     state.heartbeatIntervalMs = payload.d.heartbeat_interval;
+    state.lastHeartbeatAck = Date.now();
     await this.saveState(state);
+
+    // Identify/Resume after Hello.
     await this.identifyOrResume(state);
-    await this.scheduleHeartbeat(state);
+
+    // Discord recommends first heartbeat at interval * jitter where jitter is [0, 1].
+    const firstDelay = Math.floor(payload.d.heartbeat_interval * Math.random());
+    await this.ctx.storage.setAlarm(Date.now() + firstDelay);
   }
 
   private async handleDispatch(
@@ -482,8 +729,11 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     if (payload.t === "READY") {
       const ready = payload as GatewayReady;
       state.sessionId = ready.d.session_id;
-      state.wsUrl = ready.d.resume_gateway_url ?? state.wsUrl;
+      state.resumeGatewayUrl = ready.d.resume_gateway_url ?? state.resumeGatewayUrl;
       state.reconnectAttempts = 0;
+      state.reconnectStrategy = "resume-or-identify";
+      state.identifyCooldownUntil = null;
+      state.reconnectDisabled = false;
       await this.saveState(state);
       console.log("discord-gateway: READY", {
         sessionId: state.sessionId,
@@ -495,6 +745,8 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     // RESUMED — reset backoff counter
     if (payload.t === "RESUMED") {
       state.reconnectAttempts = 0;
+      state.reconnectStrategy = "resume-or-identify";
+      state.reconnectDisabled = false;
       await this.saveState(state);
       console.log("discord-gateway: RESUMED");
       return;
@@ -517,11 +769,11 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       console.warn(
         "discord-gateway: reconnect rate limited — falling back to backoff",
       );
-      await this.reconnectWithBackoff();
+      await this.reconnectWithBackoff({ strategy: "resume-or-identify" });
       return;
     }
     this.reconnectTimestamps.push(Date.now());
-    await this.reconnectWithMinDelay();
+    await this.reconnectWithMinDelay({ strategy: "resume-or-identify" });
   }
 
   private async handleInvalidSession(
@@ -531,12 +783,29 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     console.warn("discord-gateway: invalid session", {
       resumable: payload.d,
     });
-    // Only clear session info when not resumable
+    // d=true means resume can be attempted; d=false requires new identify.
+    state.reconnectStrategy = payload.d ? "resume-or-identify" : "identify-only";
+
     if (!payload.d) {
       state.sessionId = null;
       state.sequence = null;
-      await this.saveState(state);
     }
+
+    state.wsUrl = null;
+    state.heartbeatIntervalMs = null;
+    await this.saveState(state);
+
+    // Close current socket before delayed reconnect.
+    if (this.upstream) {
+      this.reconnectPlanned = true;
+      try {
+        this.upstream.close(INTERNAL_RECONNECT_CLOSE_CODE, "invalid session");
+      } catch {
+        /* already closed */
+      }
+      this.upstream = null;
+    }
+
     // Discord requires 1-5s wait before re-identifying
     const delay = 1000 + Math.random() * 4000;
     await this.ctx.storage.setAlarm(Date.now() + delay);
@@ -554,7 +823,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       return;
     }
 
-    if (state.sessionId && state.sequence !== null) {
+    if (canResume(state)) {
       // Resume existing session — Discord replays missed events
       ws.send(
         JSON.stringify({
@@ -566,6 +835,46 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
           },
         }),
       );
+      return;
+    }
+
+    // Identify budget/cooldown checks for non-resume handshakes.
+    const now = Date.now();
+    if (state.identifyCooldownUntil && now < state.identifyCooldownUntil) {
+      state.wsUrl = null;
+      await this.saveState(state);
+      if (this.upstream === ws) {
+        this.reconnectPlanned = true;
+        try {
+          ws.close(INTERNAL_RECONNECT_CLOSE_CODE, "identify cooldown");
+        } catch {
+          /* already closed */
+        }
+        this.upstream = null;
+      }
+      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+      return;
+    }
+
+    if (
+      state.sessionStartRemaining !== null &&
+      state.sessionStartRemaining <= 0 &&
+      state.sessionStartResetAfterMs &&
+      state.sessionStartResetAfterMs > 0
+    ) {
+      state.identifyCooldownUntil = now + state.sessionStartResetAfterMs;
+      state.wsUrl = null;
+      await this.saveState(state);
+      if (this.upstream === ws) {
+        this.reconnectPlanned = true;
+        try {
+          ws.close(INTERNAL_RECONNECT_CLOSE_CODE, "session start limit exhausted");
+        } catch {
+          /* already closed */
+        }
+        this.upstream = null;
+      }
+      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
       return;
     }
 
@@ -584,6 +893,13 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
         },
       }),
     );
+
+    if (state.sessionStartRemaining !== null && state.sessionStartRemaining > 0) {
+      state.sessionStartRemaining -= 1;
+    }
+    state.identifyCooldownUntil = null;
+    state.reconnectStrategy = "resume-or-identify";
+    await this.saveState(state);
   }
 
   // -- Heartbeat -----------------------------------------------------------
@@ -608,7 +924,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    *
    * Uses the same protocol as `startGatewayListener()`:
    * - POST to the webhook URL
-   * - `x-discord-gateway-token` header (botToken)
+    * - `x-discord-gateway-token` header (webhookSecret or botToken fallback)
    * - Body: `{ type: "GATEWAY_<EVENT>", timestamp, data }`
    *
    * Retries once on failure with a short delay.
@@ -632,7 +948,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-discord-gateway-token": creds.botToken,
+            "x-discord-gateway-token": creds.webhookSecret ?? creds.botToken,
           },
           body: JSON.stringify(event),
         });
@@ -659,34 +975,82 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
       // Wait before retry (only if there are more attempts)
       if (attempt < WEBHOOK_MAX_ATTEMPTS - 1) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, WEBHOOK_RETRY_DELAY_MS),
-        );
+        await scheduler.wait(WEBHOOK_RETRY_DELAY_MS);
       }
     }
   }
 
   // -- Gateway URL resolution ----------------------------------------------
 
-  private async getGatewayUrl(botToken: string): Promise<string | null> {
+  private async getGatewayInfo(botToken: string): Promise<
+    | {
+        ok: true;
+        url: string;
+        sessionStartLimit: GatewayBotResponse["session_start_limit"];
+      }
+    | { ok: false; error: string; retryable: boolean; status?: number }
+  > {
     try {
       const response = await fetch(GATEWAY_BOT_URL, {
         headers: { Authorization: `Bot ${botToken}` },
       });
+
       if (!response.ok) {
-        console.error(
-          `discord-gateway: GET /gateway/bot failed (${response.status})`,
-        );
-        return null;
+        return {
+          ok: false,
+          error: `GET /gateway/bot failed (${response.status})`,
+          retryable:
+            response.status === 429 ||
+            response.status >= 500 ||
+            response.status === 408,
+          status: response.status,
+        };
       }
-      const data = (await response.json()) as { url: string };
-      return data.url;
+
+      const data = (await response.json()) as GatewayBotResponse;
+      if (!data.url) {
+        return {
+          ok: false,
+          error: "GET /gateway/bot returned no URL",
+          retryable: true,
+        };
+      }
+
+      return {
+        ok: true,
+        url: data.url,
+        sessionStartLimit: data.session_start_limit,
+      };
     } catch (error) {
-      console.error("discord-gateway: failed to get gateway URL", {
-        error: String(error),
-      });
-      return null;
+      return {
+        ok: false,
+        error: `failed to get gateway URL: ${String(error)}`,
+        retryable: true,
+      };
     }
+  }
+
+  private async stopReconnecting(code: number, reason: string): Promise<void> {
+    const state = (await this.loadState()) ?? emptyState();
+    const policy = classifyCloseCode(code);
+
+    this.reconnectDisabled = true;
+    state.wsUrl = null;
+    state.heartbeatIntervalMs = null;
+    state.reconnectDisabled = true;
+    if (!policy.canResume) {
+      state.sessionId = null;
+      state.sequence = null;
+      state.reconnectStrategy = "identify-only";
+    }
+
+    await this.saveState(state);
+    await this.ctx.storage.deleteAlarm();
+
+    console.error("discord-gateway: stopped reconnecting due to close code", {
+      code,
+      reason,
+    });
   }
 
   // -- Storage helpers -----------------------------------------------------
@@ -700,8 +1064,9 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   }
 
   private async loadState(): Promise<GatewayState | null> {
-    const state = await this.ctx.storage.get<GatewayState>(STATE_KEY);
-    return state ?? null;
+    const state = await this.ctx.storage.get<Partial<GatewayState>>(STATE_KEY);
+    if (!state) return null;
+    return normalizeState(state);
   }
 
   private async saveState(state: GatewayState): Promise<void> {
@@ -714,13 +1079,102 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 function emptyState(): GatewayState {
   return {
     wsUrl: null,
+    resumeGatewayUrl: null,
     sessionId: null,
     sequence: null,
     heartbeatIntervalMs: null,
     lastHeartbeatAck: null,
     connectedAt: null,
     reconnectAttempts: 0,
+    reconnectStrategy: "resume-or-identify",
+    identifyCooldownUntil: null,
+    sessionStartRemaining: null,
+    sessionStartResetAfterMs: null,
+    sessionStartTotal: null,
+    sessionStartMaxConcurrency: null,
+    reconnectDisabled: false,
   };
+}
+
+function normalizeState(state: Partial<GatewayState>): GatewayState {
+  return {
+    ...emptyState(),
+    ...state,
+    reconnectAttempts: state.reconnectAttempts ?? 0,
+    reconnectStrategy: state.reconnectStrategy ?? "resume-or-identify",
+    reconnectDisabled: state.reconnectDisabled ?? false,
+  };
+}
+
+function canResume(state: GatewayState): boolean {
+  return (
+    state.reconnectStrategy !== "identify-only" &&
+    !!state.sessionId &&
+    state.sequence !== null
+  );
+}
+
+function classifyCloseCode(code: number): {
+  shouldReconnect: boolean;
+  canResume: boolean;
+} {
+  const shouldReconnect = !NON_RECONNECTABLE_CLOSE_CODES.has(code);
+  const canResume = shouldReconnect && !NON_RESUMABLE_CLOSE_CODES.has(code);
+  return { shouldReconnect, canResume };
+}
+
+function isPrivateHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+
+  if (
+    lower === "localhost" ||
+    lower.endsWith(".localhost") ||
+    lower.endsWith(".local")
+  ) {
+    return true;
+  }
+
+  if (isPrivateIpv4(lower) || isPrivateIpv6(lower)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isPrivateIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) return false;
+
+  const nums = parts.map((part) => Number(part));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+
+  const [a, b] = nums;
+
+  // Loopback, private, link-local, unspecified
+  return (
+    a === 10 ||
+    a === 127 ||
+    a === 0 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+function isPrivateIpv6(host: string): boolean {
+  // Handle IPv4-mapped IPv6 literals (e.g. ::ffff:127.0.0.1)
+  if (host.includes(".")) {
+    const ipv4 = host.slice(host.lastIndexOf(":") + 1);
+    if (isPrivateIpv4(ipv4)) return true;
+  }
+
+  const lower = host.toLowerCase();
+
+  // Loopback/unspecified
+  if (lower === "::1" || lower === "::") return true;
+
+  // Unique local fc00::/7 and link-local fe80::/10
+  return /^f[c-d]/i.test(lower) || /^fe[89ab]/i.test(lower);
 }
 
 function isForwardedEventType(t: string): t is ForwardedEventType {

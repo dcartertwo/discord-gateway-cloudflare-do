@@ -18,7 +18,7 @@ export interface DiscordGatewayOptions {
    *     ]
    *   },
    *   "migrations": [
-   *     { "tag": "v1", "new_classes": ["DiscordGatewayDO"] }
+   *     { "tag": "v1", "new_sqlite_classes": ["DiscordGatewayDO"] }
    *   ]
    * }
    * ```
@@ -56,7 +56,18 @@ export interface GatewayCredentials {
 
   /** URL to forward Gateway events to (your Chat SDK webhook endpoint) */
   webhookUrl: string;
+
+  /**
+   * Optional secret used for webhook authentication.
+   * If omitted, botToken is used for backward compatibility.
+   */
+  webhookSecret?: string;
 }
+
+/**
+ * Strategy used for the next reconnect attempt.
+ */
+export type ReconnectStrategy = "resume-or-identify" | "identify-only";
 
 /**
  * Persistent state stored in DO storage across reconnects.
@@ -64,6 +75,9 @@ export interface GatewayCredentials {
 export interface GatewayState {
   /** WebSocket URL (updated with resume_gateway_url from READY) */
   wsUrl: string | null;
+
+  /** Resume Gateway URL from READY (preferred for session resume reconnects) */
+  resumeGatewayUrl: string | null;
 
   /** Session ID for resume (from READY payload) */
   sessionId: string | null;
@@ -82,6 +96,21 @@ export interface GatewayState {
 
   /** Number of consecutive reconnect attempts (for backoff calculation) */
   reconnectAttempts: number;
+
+  /** How the next reconnect should authenticate */
+  reconnectStrategy: ReconnectStrategy;
+
+  /** Timestamp (ms) after which Identify is allowed again, if rate-limited */
+  identifyCooldownUntil: number | null;
+
+  /** Session start limit metadata from /gateway/bot (best-effort tracking) */
+  sessionStartRemaining: number | null;
+  sessionStartResetAfterMs: number | null;
+  sessionStartTotal: number | null;
+  sessionStartMaxConcurrency: number | null;
+
+  /** Terminal gateway state (non-reconnectable close code encountered) */
+  reconnectDisabled: boolean;
 }
 
 /**
@@ -90,6 +119,7 @@ export interface GatewayState {
 export interface StoredCredentials {
   botToken: string;
   webhookUrl: string;
+  webhookSecret?: string;
 }
 
 /**
@@ -101,6 +131,20 @@ export interface GatewayStatus {
   connectedAt: string | null;
   sequence: number | null;
   reconnectAttempts: number;
+}
+
+/** /gateway/bot session start limits (Discord Gateway) */
+export interface GatewaySessionStartLimit {
+  total: number;
+  remaining: number;
+  reset_after: number;
+  max_concurrency: number;
+}
+
+/** /gateway/bot response subset used by this package */
+export interface GatewayBotResponse {
+  url: string;
+  session_start_limit?: GatewaySessionStartLimit;
 }
 
 // -- Discord Gateway protocol types ----------------------------------------

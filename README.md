@@ -1,6 +1,9 @@
 # discord-gateway-cloudflare-do
 
-[![npm](https://img.shields.io/npm/v/discord-gateway-cloudflare-do)](https://www.npmjs.com/package/discord-gateway-cloudflare-do)
+[![CI](https://github.com/dcartertwo/discord-gateway-cloudflare-do/actions/workflows/ci.yml/badge.svg)](https://github.com/dcartertwo/discord-gateway-cloudflare-do/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/discord-gateway-cloudflare-do)](https://www.npmjs.com/package/discord-gateway-cloudflare-do)
+[![npm downloads](https://img.shields.io/npm/dm/discord-gateway-cloudflare-do)](https://www.npmjs.com/package/discord-gateway-cloudflare-do)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Persistent Discord Gateway WebSocket via [Durable Objects](https://developers.cloudflare.com/durable-objects/). Forwards messages and reactions to your Worker as HTTP POSTs — no discord.js, no Node.js, no cron.
 

@@ -1,0 +1,17 @@
+{
+  "name": "discord-bot-standalone",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "discord-gateway-cloudflare-do": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.14.0"
+  }
+}

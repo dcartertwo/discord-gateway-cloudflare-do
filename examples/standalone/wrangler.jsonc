@@ -1,0 +1,13 @@
+{
+  "name": "discord-bot-standalone",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "DISCORD_GATEWAY", "class_name": "DiscordGatewayDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_classes": ["DiscordGatewayDO"] }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "name": "discord-gateway-cloudflare-do",
+  "version": "0.1.0",
+  "description": "Cloudflare Durable Objects Discord Gateway for Chat SDK — persistent WebSocket with session resume, heartbeat via alarms, and automatic reconnection",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "chat-sdk",
+    "discord",
+    "cloudflare",
+    "cloudflare-workers",
+    "durable-objects",
+    "gateway",
+    "websocket",
+    "chat-adapter"
+  ],
+  "author": "Dan Carter",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dcartertwo/discord-gateway-cloudflare-do.git"
+  },
+  "homepage": "https://github.com/dcartertwo/discord-gateway-cloudflare-do#readme",
+  "bugs": {
+    "url": "https://github.com/dcartertwo/discord-gateway-cloudflare-do/issues"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.18",
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
+  }
+}

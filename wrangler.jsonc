@@ -1,0 +1,14 @@
+// Wrangler config for vitest — not used at deploy time.
+// Consumers define their own wrangler config with the DO binding.
+{
+  "name": "discord-gateway-cloudflare-do-test",
+  "compatibility_date": "2025-04-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "DISCORD_GATEWAY", "class_name": "DiscordGatewayDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_classes": ["DiscordGatewayDO"] }
+  ]
+}

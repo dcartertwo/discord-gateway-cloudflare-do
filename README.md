@@ -43,11 +43,11 @@ export default {
       return new Response("OK");
     }
 
-    // Connect the Gateway (one-time — persists across deploys and evictions)
-    if (url.pathname === "/connect" && request.method === "POST") {
+    // Start the Gateway (one-time — persists across deploys and evictions)
+    if (url.pathname === "/start" && request.method === "POST") {
       const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
       return Response.json(
-        await gateway.connect({
+        await gateway.start({
           botToken: env.DISCORD_BOT_TOKEN,
           webhookUrl: `${url.origin}/webhook`,
           webhookSecret: env.DISCORD_GATEWAY_SECRET,
@@ -77,25 +77,25 @@ export default {
 }
 ```
 
-Deploy, then connect once:
+Deploy, then start the gateway once:
 
 ```bash
 npx wrangler deploy
-curl -X POST https://my-bot.example.com/connect
+curl -X POST https://my-bot.example.com/start
 ```
 
 That's it. The connection survives Worker redeployments and DO evictions.
 
 ## Discord Prerequisites
 
-Use Discord's official docs to configure your app and bot before calling `/connect`:
+Use Discord's official docs to configure your app and bot before calling `/start`:
 
 - [Getting Started](https://discord.com/developers/docs/quick-start/getting-started)
 - [Gateway Intents](https://discord.com/developers/docs/topics/gateway#gateway-intents)
 - [Privileged Intents](https://discord.com/developers/docs/topics/gateway#privileged-intents)
 - [OAuth2 / Bot Authorization](https://discord.com/developers/docs/topics/oauth2)
 
-If intents are misconfigured, Discord will close with `4014` and the DO will stop reconnecting until config is fixed and `/connect` is called again.
+If intents are misconfigured, Discord will close with `4014` and the DO will stop reconnecting until config is fixed and `/start` is called again.
 
 ## How It Works
 
@@ -144,12 +144,12 @@ const gateway = getGatewayStub({
 });
 ```
 
-### `gateway.connect(credentials)`
+### `gateway.start(credentials)`
 
 Stores credentials and opens a WebSocket to the Discord Gateway.
 
 ```typescript
-await gateway.connect({
+await gateway.start({
   botToken: "MTk...",
   webhookUrl: "https://my-bot.example.com/webhook",
   webhookSecret: "your-random-webhook-secret",
@@ -189,7 +189,7 @@ const gateway = getGatewayStub({
   name: agentId, // "agent-1", "agent-2", etc.
 });
 
-await gateway.connect({
+await gateway.start({
   botToken: agentBotToken,
   webhookUrl: `https://my-app.example.com/webhook?agent=${agentId}`,
 });

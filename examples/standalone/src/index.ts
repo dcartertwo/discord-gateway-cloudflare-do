@@ -66,9 +66,9 @@ export default {
 
     // ── Gateway management ───────────────────────────────────────────
 
-    if (url.pathname === "/gateway/connect" && request.method === "POST") {
+    if (url.pathname === "/gateway/start" && request.method === "POST") {
       const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
-      const result = await gateway.connect({
+      const result = await gateway.start({
         botToken: env.DISCORD_BOT_TOKEN,
         webhookUrl: `${url.origin}/webhook`,
         webhookSecret: env.DISCORD_GATEWAY_SECRET,

@@ -4,7 +4,7 @@
  * This Worker handles Discord messages via three mechanisms:
  * 1. HTTP Interactions (slash commands, button clicks) — Discord POSTs directly
  * 2. Gateway events (messages, reactions) — DiscordGatewayDO forwards via HTTP
- * 3. Management routes — connect/disconnect/status for the Gateway DO
+ * 3. Management routes — start/disconnect/status for the Gateway DO
  *
  * Both interaction types land on the same `/webhooks/discord` endpoint.
  * The Chat SDK's handleWebhook() auto-detects which type based on headers.
@@ -81,9 +81,9 @@ export default {
 
     // ── Gateway management ───────────────────────────────────────────
 
-    if (url.pathname === "/gateway/connect" && request.method === "POST") {
+    if (url.pathname === "/gateway/start" && request.method === "POST") {
       const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
-      const result = await gateway.connect({
+      const result = await gateway.start({
         botToken: env.DISCORD_BOT_TOKEN,
         webhookUrl: `${url.origin}/webhooks/discord`,
       });

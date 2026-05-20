@@ -161,8 +161,6 @@ Returns `{ status: "connecting" }` on success, `{ error: string }` on failure. T
 
 `webhookSecret` is optional but strongly recommended. If omitted, the DO falls back to using `botToken` in the forwarding header for backward compatibility.
 
-> **Note:** Earlier 0.1.x versions exposed this method as `connect()`. That name is reserved at runtime by `Fetcher.connect(SocketAddress)` (every `DurableObjectStub` extends `Fetcher`), so calling `stub.connect(credentials)` throws `TypeError: The value cannot be converted because it is not an integer.` instead of dispatching to the DO. Use `start()` instead. The `connect()` method survives as an in-class alias for `runInDurableObject` callers and will be removed in 0.2.
-
 ### `gateway.disconnect()`
 
 Closes the WebSocket and clears all stored credentials and state.

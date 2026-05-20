@@ -139,7 +139,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   // -- Public RPC methods --------------------------------------------------
 
   /**
-   * Connect to the Discord Gateway.
+   * Start the Discord Gateway connection.
    * Stores credentials and initiates the WebSocket connection.
    *
    * The connection is established asynchronously — this method returns
@@ -147,9 +147,16 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    * may still be in progress. Poll `status()` to confirm the
    * connection is fully established.
    *
+   * Named `start` (not `connect`) because `DurableObjectStub` extends
+   * `Fetcher`, whose built-in `connect(SocketAddress)` method is resolved
+   * by the RPC dispatcher before any user-defined `connect` on the DO.
+   * Calling `stub.connect(credentials)` would route to the TCP socket
+   * builtin and throw a SocketAddress TypeError instead of dispatching
+   * to this method.
+   *
    * @returns `{ status: "connecting" }` on success, `{ error: string }` on failure.
    */
-  async connect(
+  async start(
     credentials: GatewayCredentials,
   ): Promise<{ status: "connecting" } | { error: string }> {
     if (!credentials.botToken || !credentials.webhookUrl) {
@@ -191,6 +198,19 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       return { error: result.error };
     }
     return { status: "connecting" };
+  }
+
+  /**
+   * @deprecated Use {@link start} instead. This alias is unreachable
+   * through a `DurableObjectStub` because `Fetcher.connect(SocketAddress)`
+   * shadows it in the RPC dispatcher; it remains only for in-process
+   * callers (e.g. `runInDurableObject` in tests, or subclasses that
+   * call `super.connect(...)`). Will be removed in 0.2.
+   */
+  async connect(
+    credentials: GatewayCredentials,
+  ): Promise<{ status: "connecting" } | { error: string }> {
+    return this.start(credentials);
   }
 
   /**

@@ -21,9 +21,9 @@ import type { DiscordGatewayDO } from "./durable-object";
  *
  * export { DiscordGatewayDO };
  *
- * // Get a stub and connect
+ * // Get a stub and start the gateway connection
  * const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
- * await gateway.connect({ botToken: env.DISCORD_BOT_TOKEN, webhookUrl });
+ * await gateway.start({ botToken: env.DISCORD_BOT_TOKEN, webhookUrl });
  *
  * // Multi-agent: one gateway per agent
  * const gateway = getGatewayStub({

@@ -172,9 +172,20 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       return { error: "webhookUrl must be a valid URL" };
     }
 
+    // Reject here rather than at forward time, where a throwing Headers
+    // constructor would drop every event with no signal to the caller.
+    if (credentials.webhookHeaders) {
+      try {
+        new Headers(credentials.webhookHeaders);
+      } catch {
+        return { error: "webhookHeaders must be valid header names and values" };
+      }
+    }
+
     const stored: StoredCredentials = {
       botToken: credentials.botToken,
       webhookUrl: credentials.webhookUrl,
+      webhookHeaders: credentials.webhookHeaders,
       webhookSecret: credentials.webhookSecret,
     };
     await this.ctx.storage.put(CREDENTIALS_KEY, stored);
@@ -191,6 +202,19 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       return { error: result.error };
     }
     return { status: "connecting" };
+  }
+
+  /**
+   * Stub-safe alias for {@link connect}.
+   *
+   * `DurableObjectStub` reserves `connect` for the Sockets API, so
+   * `stub.connect(credentials)` never reaches the RPC method above.
+   * Call this from a stub instead; semantics are identical.
+   */
+  async connectGateway(
+    credentials: GatewayCredentials,
+  ): Promise<{ status: "connecting" } | { error: string }> {
+    return this.connect(credentials);
   }
 
   /**
@@ -246,7 +270,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
         error: String(error),
       });
       // Always reschedule — prevents permanent alarm loss after 6 retries
-      await this.ctx.storage.setAlarm(Date.now() + ALARM_FALLBACK_DELAY_MS);
+      await this.setAlarmAt(Date.now() + ALARM_FALLBACK_DELAY_MS);
     }
   }
 
@@ -273,7 +297,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
     // Identify cooldown window from /gateway/bot session_start_limit.
     if (state.identifyCooldownUntil && Date.now() < state.identifyCooldownUntil) {
-      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+      await this.setAlarmAt(state.identifyCooldownUntil);
       return;
     }
 
@@ -375,7 +399,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     if (needsIdentify) {
       const now = Date.now();
       if (state.identifyCooldownUntil && now < state.identifyCooldownUntil) {
-        await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+        await this.setAlarmAt(state.identifyCooldownUntil);
         return {
           ok: false,
           error: "identify cooldown active",
@@ -392,7 +416,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
         state.identifyCooldownUntil = now + state.sessionStartResetAfterMs;
         state.wsUrl = null;
         await this.saveState(state);
-        await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+        await this.setAlarmAt(state.identifyCooldownUntil);
         return {
           ok: false,
           error: "session start limit exhausted; waiting for reset",
@@ -488,7 +512,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       strategy: state.reconnectStrategy,
       reason: options?.reason,
     });
-    await this.ctx.storage.setAlarm(Date.now() + delay);
+    await this.setAlarmAt(Date.now() + delay);
   }
 
   /**
@@ -524,7 +548,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     }
 
     // Minimum 1-second delay via alarm — doesn't block the DO
-    await this.ctx.storage.setAlarm(Date.now() + 1000);
+    await this.setAlarmAt(Date.now() + 1000);
   }
 
   /**
@@ -718,7 +742,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
     // Discord recommends first heartbeat at interval * jitter where jitter is [0, 1].
     const firstDelay = Math.floor(payload.d.heartbeat_interval * Math.random());
-    await this.ctx.storage.setAlarm(Date.now() + firstDelay);
+    await this.setAlarmAt(Date.now() + firstDelay);
   }
 
   private async handleDispatch(
@@ -808,7 +832,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
     // Discord requires 1-5s wait before re-identifying
     const delay = 1000 + Math.random() * 4000;
-    await this.ctx.storage.setAlarm(Date.now() + delay);
+    await this.setAlarmAt(Date.now() + delay);
   }
 
   // -- Identify / Resume ---------------------------------------------------
@@ -852,7 +876,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
         }
         this.upstream = null;
       }
-      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+      await this.setAlarmAt(state.identifyCooldownUntil);
       return;
     }
 
@@ -874,7 +898,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
         }
         this.upstream = null;
       }
-      await this.ctx.storage.setAlarm(state.identifyCooldownUntil);
+      await this.setAlarmAt(state.identifyCooldownUntil);
       return;
     }
 
@@ -914,7 +938,7 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
 
   private async scheduleHeartbeat(state: GatewayState): Promise<void> {
     if (!state.heartbeatIntervalMs) return;
-    await this.ctx.storage.setAlarm(Date.now() + state.heartbeatIntervalMs);
+    await this.setAlarmAt(Date.now() + state.heartbeatIntervalMs);
   }
 
   // -- Event forwarding (Chat SDK protocol) --------------------------------
@@ -926,6 +950,10 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
    * - POST to the webhook URL
     * - `x-discord-gateway-token` header (webhookSecret or botToken fallback)
    * - Body: `{ type: "GATEWAY_<EVENT>", timestamp, data }`
+   *
+   * Any configured `webhookHeaders` are sent too, but the two protocol
+   * headers above always win. They are applied through `Headers.set()`
+   * so a caller-supplied `content-type` is replaced, not duplicated.
    *
    * Retries once on failure with a short delay.
    */
@@ -942,14 +970,18 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       data,
     };
 
+    const headers = new Headers(creds.webhookHeaders);
+    headers.set("Content-Type", "application/json");
+    headers.set(
+      "x-discord-gateway-token",
+      creds.webhookSecret ?? creds.botToken,
+    );
+
     for (let attempt = 0; attempt < WEBHOOK_MAX_ATTEMPTS; attempt++) {
       try {
         const response = await fetch(creds.webhookUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-discord-gateway-token": creds.webhookSecret ?? creds.botToken,
-          },
+          headers,
           body: JSON.stringify(event),
         });
 
@@ -1054,6 +1086,14 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   }
 
   // -- Storage helpers -----------------------------------------------------
+
+  /**
+   * Single write path for alarms. DO alarms take an integer millisecond
+   * timestamp, but heartbeat jitter and reconnect backoff are fractional.
+   */
+  private setAlarmAt(timestampMs: number): Promise<void> {
+    return this.ctx.storage.setAlarm(Math.floor(timestampMs));
+  }
 
   private async loadCredentials(): Promise<StoredCredentials | null> {
     if (this.cachedCredentials) return this.cachedCredentials;

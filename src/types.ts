@@ -58,6 +58,15 @@ export interface GatewayCredentials {
   webhookUrl: string;
 
   /**
+   * Optional extra headers sent with every forwarded event, for example
+   * auth expected by a proxy in front of your webhook.
+   *
+   * `Content-Type` and `x-discord-gateway-token` are owned by the
+   * forwarding protocol and always override these, regardless of casing.
+   */
+  webhookHeaders?: Record<string, string>;
+
+  /**
    * Optional secret used for webhook authentication.
    * If omitted, botToken is used for backward compatibility.
    */
@@ -119,6 +128,7 @@ export interface GatewayState {
 export interface StoredCredentials {
   botToken: string;
   webhookUrl: string;
+  webhookHeaders?: Record<string, string>;
   webhookSecret?: string;
 }
 

@@ -47,7 +47,7 @@ export default {
     if (url.pathname === "/connect" && request.method === "POST") {
       const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
       return Response.json(
-        await gateway.connect({
+        await gateway.connectGateway({
           botToken: env.DISCORD_BOT_TOKEN,
           webhookUrl: `${url.origin}/webhook`,
           webhookSecret: env.DISCORD_GATEWAY_SECRET,
@@ -144,12 +144,12 @@ const gateway = getGatewayStub({
 });
 ```
 
-### `gateway.connect(credentials)`
+### `gateway.connectGateway(credentials)`
 
 Stores credentials and opens a WebSocket to the Discord Gateway.
 
 ```typescript
-await gateway.connect({
+await gateway.connectGateway({
   botToken: "MTk...",
   webhookUrl: "https://my-bot.example.com/webhook",
   webhookSecret: "your-random-webhook-secret",
@@ -159,7 +159,11 @@ await gateway.connect({
 
 Returns `{ status: "connecting" }` on success, `{ error: string }` on failure. The webhook URL must be HTTPS.
 
+Call `connectGateway()` — not `connect()` — through a stub. `DurableObjectStub` reserves `connect` for the Sockets API, so it never reaches the DO. `connect()` remains available when you hold the instance directly (for example inside `runInDurableObject`).
+
 `webhookSecret` is optional but strongly recommended. If omitted, the DO falls back to using `botToken` in the forwarding header for backward compatibility.
+
+`webhookHeaders` is an optional `Record<string, string>` of extra headers sent with every forwarded event — useful when a proxy in front of your webhook expects its own auth. It is persisted with the other credentials and reloaded after a DO eviction. `Content-Type` and `x-discord-gateway-token` belong to the forwarding protocol and always override these, whatever casing you use.
 
 ### `gateway.disconnect()`
 
@@ -189,7 +193,7 @@ const gateway = getGatewayStub({
   name: agentId, // "agent-1", "agent-2", etc.
 });
 
-await gateway.connect({
+await gateway.connectGateway({
   botToken: agentBotToken,
   webhookUrl: `https://my-app.example.com/webhook?agent=${agentId}`,
 });

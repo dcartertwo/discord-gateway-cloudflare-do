@@ -23,7 +23,7 @@ import type { DiscordGatewayDO } from "./durable-object";
  *
  * // Get a stub and connect
  * const gateway = getGatewayStub({ namespace: env.DISCORD_GATEWAY });
- * await gateway.connect({ botToken: env.DISCORD_BOT_TOKEN, webhookUrl });
+ * await gateway.connectGateway({ botToken: env.DISCORD_BOT_TOKEN, webhookUrl });
  *
  * // Multi-agent: one gateway per agent
  * const gateway = getGatewayStub({

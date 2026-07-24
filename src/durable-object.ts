@@ -172,9 +172,20 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       return { error: "webhookUrl must be a valid URL" };
     }
 
+    // Reject here rather than at forward time, where a throwing Headers
+    // constructor would drop every event with no signal to the caller.
+    if (credentials.webhookHeaders) {
+      try {
+        new Headers(credentials.webhookHeaders);
+      } catch {
+        return { error: "webhookHeaders must be valid header names and values" };
+      }
+    }
+
     const stored: StoredCredentials = {
       botToken: credentials.botToken,
       webhookUrl: credentials.webhookUrl,
+      webhookHeaders: credentials.webhookHeaders,
       webhookSecret: credentials.webhookSecret,
     };
     await this.ctx.storage.put(CREDENTIALS_KEY, stored);
@@ -940,6 +951,10 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
     * - `x-discord-gateway-token` header (webhookSecret or botToken fallback)
    * - Body: `{ type: "GATEWAY_<EVENT>", timestamp, data }`
    *
+   * Any configured `webhookHeaders` are sent too, but the two protocol
+   * headers above always win. They are applied through `Headers.set()`
+   * so a caller-supplied `content-type` is replaced, not duplicated.
+   *
    * Retries once on failure with a short delay.
    */
   private async forwardEvent(
@@ -955,14 +970,18 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
       data,
     };
 
+    const headers = new Headers(creds.webhookHeaders);
+    headers.set("Content-Type", "application/json");
+    headers.set(
+      "x-discord-gateway-token",
+      creds.webhookSecret ?? creds.botToken,
+    );
+
     for (let attempt = 0; attempt < WEBHOOK_MAX_ATTEMPTS; attempt++) {
       try {
         const response = await fetch(creds.webhookUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-discord-gateway-token": creds.webhookSecret ?? creds.botToken,
-          },
+          headers,
           body: JSON.stringify(event),
         });
 

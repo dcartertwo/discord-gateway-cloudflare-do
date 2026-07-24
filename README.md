@@ -163,6 +163,8 @@ Call `connectGateway()` — not `connect()` — through a stub. `DurableObjectSt
 
 `webhookSecret` is optional but strongly recommended. If omitted, the DO falls back to using `botToken` in the forwarding header for backward compatibility.
 
+`webhookHeaders` is an optional `Record<string, string>` of extra headers sent with every forwarded event — useful when a proxy in front of your webhook expects its own auth. It is persisted with the other credentials and reloaded after a DO eviction. `Content-Type` and `x-discord-gateway-token` belong to the forwarding protocol and always override these, whatever casing you use.
+
 ### `gateway.disconnect()`
 
 Closes the WebSocket and clears all stored credentials and state.

@@ -21,6 +21,8 @@ interface Env {
   DISCORD_GATEWAY: DurableObjectNamespace<DiscordGatewayDO>;
   DISCORD_BOT_TOKEN: string;
   DISCORD_GATEWAY_SECRET: string;
+  /** Optional — only needed if a proxy sits in front of the webhook */
+  WEBHOOK_PROXY_TOKEN?: string;
 }
 
 /**
@@ -72,6 +74,11 @@ export default {
         botToken: env.DISCORD_BOT_TOKEN,
         webhookUrl: `${url.origin}/webhook`,
         webhookSecret: env.DISCORD_GATEWAY_SECRET,
+        // Optional: extra headers sent with every forwarded event, for
+        // example auth expected by a proxy in front of this Worker.
+        webhookHeaders: env.WEBHOOK_PROXY_TOKEN
+          ? { "x-proxy-token": env.WEBHOOK_PROXY_TOKEN }
+          : undefined,
       });
       return Response.json(result);
     }

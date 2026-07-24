@@ -32,6 +32,11 @@ function getStub() {
   return env.DISCORD_GATEWAY.get(id);
 }
 
+function forwardedHeaders(fetchSpy: { mock: { calls: any[][] } }): Headers {
+  const init = fetchSpy.mock.calls[0][1] as RequestInit;
+  return new Headers(init.headers);
+}
+
 function fakeWebSocket() {
   return {
     send: vi.fn(),
@@ -796,9 +801,96 @@ describe("DiscordGatewayDO", () => {
           await (instance as any).forwardEvent("MESSAGE_CREATE", { id: "1" });
 
           expect(fetchSpy).toHaveBeenCalled();
-          const init = fetchSpy.mock.calls[0][1] as RequestInit;
-          const headers = init.headers as Record<string, string>;
-          expect(headers["x-discord-gateway-token"]).toBe("secret-token");
+          const headers = forwardedHeaders(fetchSpy);
+          expect(headers.get("x-discord-gateway-token")).toBe("secret-token");
+          expect(headers.get("content-type")).toBe("application/json");
+
+          fetchSpy.mockRestore();
+        },
+      );
+    });
+
+    it("forwards custom webhookHeaders reloaded from storage", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-webhook-custom-headers");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          vi.spyOn(instance as any, "connectInternal").mockResolvedValue({
+            ok: true,
+          });
+
+          await instance.connect({
+            botToken: "bot-token",
+            webhookUrl: "https://example.com/webhook",
+            webhookSecret: "secret-token",
+            webhookHeaders: {
+              "x-custom-header": "custom-value",
+              "content-type": "text/plain",
+              "X-Discord-Gateway-Token": "spoofed",
+            },
+          });
+
+          // Force a reload from storage rather than the in-memory cache.
+          (instance as any).cachedCredentials = null;
+
+          const fetchSpy = vi
+            .spyOn(globalThis, "fetch")
+            .mockResolvedValue(new Response(null, { status: 200 }));
+
+          await (instance as any).forwardEvent("MESSAGE_CREATE", { id: "1" });
+
+          const headers = forwardedHeaders(fetchSpy);
+          expect(headers.get("x-custom-header")).toBe("custom-value");
+          expect(headers.get("content-type")).toBe("application/json");
+          expect(headers.get("x-discord-gateway-token")).toBe("secret-token");
+
+          fetchSpy.mockRestore();
+        },
+      );
+    });
+
+    it("rejects invalid webhookHeaders at connect time", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-webhook-invalid-headers");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          const res = await instance.connect({
+            botToken: "bot-token",
+            webhookUrl: "https://example.com/webhook",
+            webhookHeaders: { "bad header name": "value" },
+          });
+
+          expect("error" in res).toBe(true);
+          expect((res as { error: string }).error).toContain("webhookHeaders");
+          expect(
+            await instance.ctx.storage.get(CREDENTIALS_KEY),
+          ).toBeUndefined();
+        },
+      );
+    });
+
+    it("forwards credentials stored without webhookHeaders", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-webhook-legacy-creds");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          await instance.ctx.storage.put(CREDENTIALS_KEY, {
+            botToken: "bot-token",
+            webhookUrl: "https://example.com/webhook",
+          });
+
+          const fetchSpy = vi
+            .spyOn(globalThis, "fetch")
+            .mockResolvedValue(new Response(null, { status: 200 }));
+
+          await (instance as any).forwardEvent("MESSAGE_CREATE", { id: "1" });
+
+          const headers = forwardedHeaders(fetchSpy);
+          expect([...headers.keys()].sort()).toEqual([
+            "content-type",
+            "x-discord-gateway-token",
+          ]);
+          expect(headers.get("x-discord-gateway-token")).toBe("bot-token");
 
           fetchSpy.mockRestore();
         },

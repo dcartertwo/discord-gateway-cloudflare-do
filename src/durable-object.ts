@@ -194,6 +194,19 @@ export class DiscordGatewayDO<TEnv = unknown> extends DurableObject<TEnv> {
   }
 
   /**
+   * Stub-safe alias for {@link connect}.
+   *
+   * `DurableObjectStub` reserves `connect` for the Sockets API, so
+   * `stub.connect(credentials)` never reaches the RPC method above.
+   * Call this from a stub instead; semantics are identical.
+   */
+  async connectGateway(
+    credentials: GatewayCredentials,
+  ): Promise<{ status: "connecting" } | { error: string }> {
+    return this.connect(credentials);
+  }
+
+  /**
    * Disconnect from the Discord Gateway.
    * Closes the WebSocket and clears all state.
    */

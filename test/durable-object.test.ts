@@ -208,6 +208,68 @@ describe("DiscordGatewayDO", () => {
     });
   });
 
+  describe("connectGateway", () => {
+    it("is callable through a Durable Object stub", async () => {
+      const stub = getStub();
+
+      const res = await stub.connectGateway({
+        botToken: "",
+        webhookUrl: "https://example.com/webhooks/discord",
+      });
+
+      expect("error" in res).toBe(true);
+      expect((res as { error: string }).error).toContain("botToken");
+    });
+
+    it("matches connect() validation results", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-connect-gateway-validation");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          const invalidInputs = [
+            { botToken: "", webhookUrl: "https://example.com/webhook" },
+            { botToken: "token", webhookUrl: "" },
+            { botToken: "token", webhookUrl: "http://example.com/webhook" },
+            { botToken: "token", webhookUrl: "not-a-url" },
+            { botToken: "token", webhookUrl: "https://u:p@example.com/webhook" },
+            { botToken: "token", webhookUrl: "https://localhost/webhook" },
+          ];
+
+          for (const input of invalidInputs) {
+            const result = await instance.connectGateway(input);
+            expect("error" in result).toBe(true);
+            expect(result).toEqual(await instance.connect(input));
+          }
+        },
+      );
+    });
+
+    it("matches connect() success contract and stored credentials", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-connect-gateway-success");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          vi.spyOn(instance as any, "connectInternal").mockResolvedValue({
+            ok: true,
+          });
+
+          const res = await instance.connectGateway({
+            botToken: "test-token",
+            webhookUrl: "https://example.com/webhooks/discord",
+            webhookSecret: "gateway-secret",
+          });
+
+          expect(res).toEqual({ status: "connecting" });
+          expect(await instance.ctx.storage.get(CREDENTIALS_KEY)).toEqual({
+            botToken: "test-token",
+            webhookUrl: "https://example.com/webhooks/discord",
+            webhookSecret: "gateway-secret",
+          });
+        },
+      );
+    });
+  });
+
   describe("disconnect", () => {
     it("clears credentials and state", async () => {
       const id = env.DISCORD_GATEWAY.idFromName("test-disconnect");

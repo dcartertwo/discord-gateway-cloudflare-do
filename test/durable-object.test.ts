@@ -418,6 +418,36 @@ describe("DiscordGatewayDO", () => {
     });
   });
 
+  // -- alarm scheduling ----------------------------------------------------
+
+  describe("alarm scheduling", () => {
+    it("floors fractional timestamps before they reach storage", async () => {
+      const id = env.DISCORD_GATEWAY.idFromName("test-alarm-integer-seam");
+      await runInDurableObject(
+        env.DISCORD_GATEWAY.get(id),
+        async (instance: DiscordGatewayDO) => {
+          const setAlarmSpy = vi.spyOn(instance.ctx.storage, "setAlarm");
+
+          // Backoff jitter makes the requested reconnect timestamp fractional.
+          const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5005);
+          await (instance as any).reconnectWithBackoff({ reason: "test" });
+          randomSpy.mockRestore();
+
+          expect(setAlarmSpy).toHaveBeenCalledTimes(1);
+          const requested = setAlarmSpy.mock.calls[0][0] as number;
+          expect(Number.isInteger(requested)).toBe(true);
+          expect(await instance.ctx.storage.getAlarm()).toBe(requested);
+
+          const fractional = Date.now() + 1234.56;
+          await (instance as any).setAlarmAt(fractional);
+          expect(setAlarmSpy).toHaveBeenLastCalledWith(Math.floor(fractional));
+
+          setAlarmSpy.mockRestore();
+        },
+      );
+    });
+  });
+
   // -- protocol and resilience behaviors -----------------------------------
 
   describe("protocol behaviors", () => {
